@@ -559,6 +559,77 @@ type JSONUpdate struct {
 	Value interface{} `json:"value"`
 }
 
+type KubeFleetUpdateConfig struct {
+	// Remote KubeFleet hub cluster to target. If omitted, the local cluster is used.
+	Hub *Hub `json:"hub,omitempty"`
+	// List of ClusterResourcePlacement resources to create or update.
+	Placements []Placement `json:"placements"`
+}
+
+// Remote KubeFleet hub cluster to target. If omitted, the local cluster is used.
+type Hub struct {
+	// Name of a Secret in the project namespace labeled kargo.akuity.io/cred-type: fleet.
+	SecretName string `json:"secretName"`
+}
+
+type Placement struct {
+	// Name of the ClusterResourcePlacement to create or patch.
+	Name string `json:"name"`
+	// Placement policy for cluster selection.
+	Policy *Policy `json:"policy,omitempty"`
+	// Cluster-scoped resources to place across the fleet.
+	ResourceSelectors []ResourceSelector `json:"resourceSelectors"`
+	// Rollout strategy for the placement.
+	Strategy *Strategy `json:"strategy,omitempty"`
+}
+
+// Placement policy for cluster selection.
+type Policy struct {
+	// Cluster affinity rules passed through to the CRP policy.
+	Affinity map[string]interface{} `json:"affinity,omitempty"`
+	// Explicit cluster names. Only valid for PickFixed.
+	ClusterNames []string `json:"clusterNames,omitempty"`
+	// Number of clusters to select. Only valid for PickN.
+	NumberOfClusters *int64 `json:"numberOfClusters,omitempty"`
+	// Placement strategy.
+	PlacementType *PlacementType `json:"placementType,omitempty"`
+	// Topology spread rules passed through to the CRP policy.
+	TopologySpreadConstraints []TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+}
+
+type TopologySpreadConstraint struct {
+	MaxSkew           *int64             `json:"maxSkew,omitempty"`
+	TopologyKey       string             `json:"topologyKey"`
+	WhenUnsatisfiable *WhenUnsatisfiable `json:"whenUnsatisfiable,omitempty"`
+}
+
+type ResourceSelector struct {
+	// API group of the resource.
+	Group string `json:"group"`
+	// Kind of the resource.
+	Kind string `json:"kind"`
+	// Name of the resource. If empty, all resources of this GVK are selected.
+	Name string `json:"name,omitempty"`
+	// API version of the resource.
+	Version string `json:"version"`
+}
+
+// Rollout strategy for the placement.
+type Strategy struct {
+	// Rolling update parameters.
+	RollingUpdate *RollingUpdate `json:"rollingUpdate,omitempty"`
+}
+
+// Rolling update parameters.
+type RollingUpdate struct {
+	// Maximum surge clusters during rollout. Can be absolute number or percentage string.
+	MaxSurge *Max `json:"maxSurge,omitempty"`
+	// Maximum unavailable clusters during rollout. Can be absolute number or percentage string.
+	MaxUnavailable *Max `json:"maxUnavailable,omitempty"`
+	// Wait time in seconds between rollout phases.
+	UnavailablePeriodSeconds *int64 `json:"unavailablePeriodSeconds,omitempty"`
+}
+
 type KustomizeBuildConfig struct {
 	// OutPath is the file path to write the built manifests to.
 	OutPath string `json:"outPath"`
@@ -791,6 +862,22 @@ const (
 	Helm OutLayout = "helm"
 )
 
+// Placement strategy.
+type PlacementType string
+
+const (
+	PickAll   PlacementType = "PickAll"
+	PickFixed PlacementType = "PickFixed"
+	PickN     PlacementType = "PickN"
+)
+
+type WhenUnsatisfiable string
+
+const (
+	DoNotSchedule  WhenUnsatisfiable = "DoNotSchedule"
+	ScheduleAnyway WhenUnsatisfiable = "ScheduleAnyway"
+)
+
 // Specifies the naming convention for output files when writing to a directory. 'kargo'
 // (default) uses '[namespace-]kind-name.yaml' format (e.g., 'deployment-myapp.yaml').
 // 'kustomize' matches the naming convention of 'kustomize build -o dir/', using
@@ -809,3 +896,8 @@ const (
 	Freight Kind = "Freight"
 	Stage   Kind = "Stage"
 )
+
+type Max struct {
+	Integer *int64
+	String  string
+}

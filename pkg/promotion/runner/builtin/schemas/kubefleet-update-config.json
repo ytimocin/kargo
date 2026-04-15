@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KubeFleetUpdateConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["placements"],
+  "properties": {
+    "hub": {
+      "type": "object",
+      "description": "Remote KubeFleet hub cluster to target. If omitted, the local cluster is used.",
+      "additionalProperties": false,
+      "required": ["secretName"],
+      "properties": {
+        "secretName": {
+          "type": "string",
+          "description": "Name of a Secret in the project namespace labeled kargo.akuity.io/cred-type: fleet.",
+          "minLength": 1
+        }
+      }
+    },
+    "placements": {
+      "type": "array",
+      "description": "List of ClusterResourcePlacement resources to create or update.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "resourceSelectors"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the ClusterResourcePlacement to create or patch.",
+            "minLength": 1
+          },
+          "resourceSelectors": {
+            "type": "array",
+            "description": "Cluster-scoped resources to place across the fleet.",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["group", "version", "kind"],
+              "properties": {
+                "group": {
+                  "type": "string",
+                  "description": "API group of the resource."
+                },
+                "version": {
+                  "type": "string",
+                  "description": "API version of the resource.",
+                  "minLength": 1
+                },
+                "kind": {
+                  "type": "string",
+                  "description": "Kind of the resource.",
+                  "minLength": 1
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Name of the resource. If empty, all resources of this GVK are selected."
+                }
+              }
+            }
+          },
+          "policy": {
+            "type": "object",
+            "description": "Placement policy for cluster selection.",
+            "additionalProperties": false,
+            "properties": {
+              "placementType": {
+                "type": "string",
+                "description": "Placement strategy.",
+                "enum": ["PickAll", "PickN", "PickFixed"],
+                "default": "PickAll"
+              },
+              "numberOfClusters": {
+                "type": "integer",
+                "description": "Number of clusters to select. Only valid for PickN.",
+                "minimum": 1
+              },
+              "clusterNames": {
+                "type": "array",
+                "description": "Explicit cluster names. Only valid for PickFixed.",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "affinity": {
+                "type": "object",
+                "description": "Cluster affinity rules passed through to the CRP policy.",
+                "additionalProperties": true
+              },
+              "topologySpreadConstraints": {
+                "type": "array",
+                "description": "Topology spread rules passed through to the CRP policy.",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": ["topologyKey"],
+                  "properties": {
+                    "topologyKey": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "maxSkew": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "whenUnsatisfiable": {
+                      "type": "string",
+                      "enum": ["DoNotSchedule", "ScheduleAnyway"]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "strategy": {
+            "type": "object",
+            "description": "Rollout strategy for the placement.",
+            "additionalProperties": false,
+            "properties": {
+              "rollingUpdate": {
+                "type": "object",
+                "description": "Rolling update parameters.",
+                "additionalProperties": false,
+                "properties": {
+                  "maxUnavailable": {
+                    "description": "Maximum unavailable clusters during rollout. Can be absolute number or percentage string.",
+                    "oneOf": [
+                      {"type": "integer", "minimum": 0},
+                      {"type": "string"}
+                    ]
+                  },
+                  "maxSurge": {
+                    "description": "Maximum surge clusters during rollout. Can be absolute number or percentage string.",
+                    "oneOf": [
+                      {"type": "integer", "minimum": 0},
+                      {"type": "string"}
+                    ]
+                  },
+                  "unavailablePeriodSeconds": {
+                    "type": "integer",
+                    "description": "Wait time in seconds between rollout phases.",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

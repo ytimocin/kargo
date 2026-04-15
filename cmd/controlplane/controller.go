@@ -6,6 +6,7 @@ import (
 	stdruntime "runtime"
 	"sync"
 
+	fleetv1 "github.com/kubefleet-dev/kubefleet/apis/placement/v1"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -182,6 +183,12 @@ func (o *controllerOptions) setupKargoManager(
 	if err = kargoapi.AddToScheme(scheme); err != nil {
 		return nil, nil, stagesReconcilerCfg, fmt.Errorf(
 			"error adding Kargo API to Kargo controller manager scheme: %w",
+			err,
+		)
+	}
+	if err = fleetv1.AddToScheme(scheme); err != nil {
+		return nil, nil, stagesReconcilerCfg, fmt.Errorf(
+			"error adding KubeFleet API to Kargo controller manager scheme: %w",
 			err,
 		)
 	}
@@ -419,7 +426,7 @@ func (o *controllerOptions) setupReconcilers(
 		argoCDClient = argocdMgr.GetClient()
 	}
 
-	healthCheckers.Initialize(argoCDClient)
+	healthCheckers.Initialize(argoCDClient, kargoMgr.GetClient())
 
 	sharedIndexer := indexer.NewSharedFieldIndexer(kargoMgr.GetFieldIndexer())
 

@@ -568,6 +568,12 @@ controller:
     ## @param controller.argocd.watchArgocdNamespaceOnly Specifies whether the reconciler that watches Argo CD Applications for the sake of forcing related Stages to reconcile should only watch Argo CD Application resources residing in Argo CD's own namespace. Note: Older versions of Argo CD only supported Argo CD Application resources in Argo CD's own namespace, but newer versions support Argo CD Application resources in any namespace. This should usually be left as `false`.
     watchArgocdNamespaceOnly: false
 
+  ## All settings relating to the use of KubeFleet for multi-cluster fleet
+  ## placement and rollout.
+  kubefleet:
+    ## @param controller.kubefleet.integrationEnabled Specifies whether KubeFleet integration is enabled. When enabled, the kubefleet-update promotion step can create and manage ClusterResourcePlacement resources and the kubefleet health checker can assess fleet-wide health. Requires KubeFleet CRDs to be installed on the same cluster.
+    integrationEnabled: false
+
   ## All settings relating to the use of Argo Rollouts AnalysisTemplates and
   ## AnalysisRuns as a means of verifying Stages after a Promotion.
   rollouts:

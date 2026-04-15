@@ -3,6 +3,7 @@
 .vscode/
 bin/
 build/
+/controlplane
 charts/kargo/*.tgz
 coverage.txt
 hack/include/
