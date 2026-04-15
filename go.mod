@@ -53,7 +53,7 @@ require (
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/klauspost/compress v1.18.5
 	github.com/ktrysmt/go-bitbucket v0.9.87
-	github.com/kubefleet-dev/kubefleet v0.2.2
+	github.com/kubefleet-dev/kubefleet v0.3.0
 	github.com/microsoft/azure-devops-go-api/azuredevops/v7 v7.1.0
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/otiai10/copy v1.14.1
