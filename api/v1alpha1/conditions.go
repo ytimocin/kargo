@@ -101,4 +101,26 @@ const (
 	// the criteria have been satisfied, and the absence of the condition or
 	// a status of "False" indicates that no new Freight was created.
 	ConditionTypeFreightCreated = "FreightCreated"
+
+	// ConditionTypePromotionsHalted denotes that auto-promotions into a Stage
+	// are currently halted. For example, one or more upstream Stages have
+	// current Freight in an Unhealthy state and the Stage's
+	// spec.promotionPolicy.onUpstreamUnhealthy is set to "Halt".
+	//
+	// This is a "normal-false" or "negative polarity" condition, meaning that
+	// the presence of the condition with a status of "True" indicates that
+	// auto-promotions are halted.
+	ConditionTypePromotionsHalted = "PromotionsHalted"
+	// ConditionTypeRolledBack denotes that the Stage's most recent transition
+	// was an auto-rollback initiated by the Stage controller in response to a
+	// verification failure. The condition remains True until a new manual or
+	// auto-promotion (other than an auto-rollback) occurs.
+	//
+	// This is an "abnormal-true" or "negative polarity" condition.
+	ConditionTypeRolledBack = "RolledBack"
 )
+
+// ReasonUpstreamUnhealthy is the Reason used for the PromotionsHalted
+// condition when the halt is caused by one or more upstream Stages having
+// Unhealthy current Freight.
+const ReasonUpstreamUnhealthy = "UpstreamUnhealthy"

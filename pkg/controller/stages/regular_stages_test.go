@@ -6480,6 +6480,203 @@ func TestRegularStageReconciler_autoPromotionAllowed(t *testing.T) {
 	}
 }
 
+func TestRegularStageReconciler_upstreamHaltActive(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, kargoapi.AddToScheme(scheme))
+
+	// Shared helpers for constructing upstream Stage fixtures.
+	healthy := func(name string) *kargoapi.Stage {
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "proj"},
+			Status: kargoapi.StageStatus{
+				Health: &kargoapi.Health{Status: kargoapi.HealthStateHealthy},
+			},
+		}
+	}
+	unhealthy := func(name string) *kargoapi.Stage {
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "proj"},
+			Status: kargoapi.StageStatus{
+				Health: &kargoapi.Health{Status: kargoapi.HealthStateUnhealthy},
+			},
+		}
+	}
+	noHealth := func(name string) *kargoapi.Stage {
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "proj"},
+		}
+	}
+
+	stageWithPolicy := func(
+		policy kargoapi.OnUpstreamUnhealthyPolicy,
+		upstreams ...string,
+	) *kargoapi.Stage {
+		s := &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "proj"},
+			Spec: kargoapi.StageSpec{
+				RequestedFreight: []kargoapi.FreightRequest{{
+					Sources: kargoapi.FreightSources{Stages: upstreams},
+				}},
+			},
+		}
+		if policy != "" {
+			s.Spec.PromotionPolicy = &kargoapi.StagePromotionPolicy{
+				OnUpstreamUnhealthy: policy,
+			}
+		}
+		return s
+	}
+
+	tests := []struct {
+		name        string
+		stage       *kargoapi.Stage
+		objects     []client.Object
+		interceptor interceptor.Funcs
+		assertions  func(*testing.T, []string, error)
+	}{
+		{
+			name:  "no PromotionPolicy -- never halts",
+			stage: stageWithPolicy("", "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "PromotionPolicy=Proceed -- never halts",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyProceed, "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + all upstreams healthy -- does not halt",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1", "upstream-2"),
+			objects: []client.Object{
+				healthy("upstream-1"),
+				healthy("upstream-2"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + one upstream Unhealthy -- halts on that upstream",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1", "upstream-2"),
+			objects: []client.Object{
+				healthy("upstream-1"),
+				unhealthy("upstream-2"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"upstream-2"}, halted)
+			},
+		},
+		{
+			name: "Halt + multiple upstreams Unhealthy -- returns all, sorted",
+			stage: stageWithPolicy(
+				kargoapi.OnUpstreamUnhealthyHalt,
+				"upstream-b", "upstream-a",
+			),
+			objects: []client.Object{
+				unhealthy("upstream-a"),
+				unhealthy("upstream-b"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"upstream-a", "upstream-b"}, halted)
+			},
+		},
+		{
+			name:  "Halt + upstream has no Health status -- treated as not Unhealthy",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1"),
+			objects: []client.Object{
+				noHealth("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + upstream not found -- ignored, does not halt",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "missing"),
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + same upstream referenced from multiple FreightRequests -- deduped",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				// Even though we'll add a second FreightRequest below,
+				// the same upstream must appear only once.
+				assert.Equal(t, []string{"upstream-1"}, halted)
+			},
+		},
+		{
+			name:  "Halt + non-NotFound Get error -- propagates",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			interceptor: interceptor.Funcs{
+				Get: func(
+					_ context.Context,
+					_ client.WithWatch,
+					_ client.ObjectKey,
+					_ client.Object,
+					_ ...client.GetOption,
+				) error {
+					return fmt.Errorf("transient API error")
+				},
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.ErrorContains(t, err, "transient API error")
+				assert.Nil(t, halted)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "Halt + same upstream referenced from multiple FreightRequests -- deduped" {
+				tt.stage.Spec.RequestedFreight = append(
+					tt.stage.Spec.RequestedFreight,
+					kargoapi.FreightRequest{
+						Sources: kargoapi.FreightSources{Stages: []string{"upstream-1"}},
+					},
+				)
+			}
+
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if len(tt.objects) > 0 {
+				builder = builder.WithObjects(tt.objects...)
+			}
+			if tt.interceptor.Get != nil {
+				builder = builder.WithInterceptorFuncs(tt.interceptor)
+			}
+			r := &RegularStageReconciler{client: builder.Build()}
+
+			halted, err := r.upstreamHaltActive(t.Context(), tt.stage)
+			tt.assertions(t, halted, err)
+		})
+	}
+}
+
 func Test_summarizeConditions(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -6885,4 +7082,664 @@ func Test_buildFreightSummary(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func Test_findLastHealthyFreightCollection(t *testing.T) {
+	verified := &kargoapi.VerificationInfo{Phase: kargoapi.VerificationPhaseSuccessful}
+	failed := &kargoapi.VerificationInfo{Phase: kargoapi.VerificationPhaseFailed}
+
+	col := func(id string, verif *kargoapi.VerificationInfo) *kargoapi.FreightCollection {
+		c := &kargoapi.FreightCollection{ID: id}
+		if verif != nil {
+			c.VerificationHistory = kargoapi.VerificationInfoStack{*verif}
+		}
+		return c
+	}
+
+	tests := []struct {
+		name     string
+		history  kargoapi.FreightHistory
+		skipID   string
+		expectID string
+	}{
+		{name: "empty history", history: nil, expectID: ""},
+		{
+			name:    "only one entry, matches skip",
+			history: kargoapi.FreightHistory{col("a", verified)},
+			skipID:  "a",
+		},
+		{
+			name: "skip current, prior healthy",
+			history: kargoapi.FreightHistory{
+				col("current", failed),
+				col("prior", verified),
+			},
+			skipID:   "current",
+			expectID: "prior",
+		},
+		{
+			name: "skip current, every prior is failed",
+			history: kargoapi.FreightHistory{
+				col("current", failed),
+				col("older", failed),
+			},
+			skipID: "current",
+		},
+		{
+			name: "returns most recent healthy prior",
+			history: kargoapi.FreightHistory{
+				col("current", failed),
+				col("second", verified),
+				col("third", verified),
+			},
+			skipID:   "current",
+			expectID: "second",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findLastHealthyFreightCollection(tt.history, tt.skipID)
+			if tt.expectID == "" {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, tt.expectID, got.ID)
+		})
+	}
+}
+
+func TestRegularStageReconciler_autoRollbackOnVerificationFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, kargoapi.AddToScheme(scheme))
+
+	const (
+		ns        = "proj"
+		stageName = "test"
+	)
+
+	// Shared helpers.
+	freightRef := func(name string) kargoapi.FreightReference {
+		return kargoapi.FreightReference{
+			Name: name,
+			Origin: kargoapi.FreightOrigin{
+				Kind: kargoapi.FreightOriginKindWarehouse,
+				Name: "wh",
+			},
+		}
+	}
+	freightCol := func(name string, phase kargoapi.VerificationPhase) *kargoapi.FreightCollection {
+		c := &kargoapi.FreightCollection{
+			ID:      name + "-id",
+			Freight: map[string]kargoapi.FreightReference{"Warehouse/wh": freightRef(name)},
+		}
+		if phase != "" {
+			c.VerificationHistory = kargoapi.VerificationInfoStack{
+				{ID: name + "-verif", Phase: phase},
+			}
+		}
+		return c
+	}
+	stageWith := func(
+		policy *kargoapi.StageRollbackPolicy,
+		history kargoapi.FreightHistory,
+		currentPromo *kargoapi.PromotionReference,
+		rollbackHistory []kargoapi.RollbackRecord,
+		origins int,
+	) *kargoapi.Stage {
+		reqs := make([]kargoapi.FreightRequest, origins)
+		for i := range origins {
+			reqs[i] = kargoapi.FreightRequest{
+				Origin: kargoapi.FreightOrigin{
+					Kind: kargoapi.FreightOriginKindWarehouse,
+					Name: fmt.Sprintf("wh-%d", i),
+				},
+			}
+		}
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: stageName, Namespace: ns},
+			Spec: kargoapi.StageSpec{
+				RequestedFreight: reqs,
+				RollbackPolicy:   policy,
+				PromotionTemplate: &kargoapi.PromotionTemplate{
+					Spec: kargoapi.PromotionTemplateSpec{
+						Steps: []kargoapi.PromotionStep{{Uses: "noop"}},
+					},
+				},
+			},
+			Status: kargoapi.StageStatus{
+				FreightHistory:   history,
+				CurrentPromotion: currentPromo,
+				RollbackHistory:  rollbackHistory,
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		stage      *kargoapi.Stage
+		assertions func(*testing.T, client.Client, kargoapi.StageStatus, error)
+	}{
+		{
+			name:  "no RollbackPolicy -- no-op",
+			stage: stageWith(nil, kargoapi.FreightHistory{freightCol("f1", kargoapi.VerificationPhaseFailed)}, nil, nil, 1),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "policy disabled -- no-op",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: false},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "multi-origin -- skipped",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil, nil, 2,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "current promotion in flight -- skipped",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				&kargoapi.PromotionReference{Name: "in-flight"}, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "current freight is not Failed/Error -- no-op",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{freightCol("f1", kargoapi.VerificationPhaseSuccessful)},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "Failed verification but no prior healthy -- no-op",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{freightCol("f1", kargoapi.VerificationPhaseFailed)},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "Failed verification with prior healthy -- creates rollback Promotion",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				require.Len(t, status.RollbackHistory, 1)
+				rec := status.RollbackHistory[0]
+				assert.Equal(t, "f1", rec.From)
+				assert.Equal(t, "f0", rec.To)
+				assert.Equal(t, kargoapi.RollbackReasonVerificationFailed, rec.Reason)
+				assert.NotEmpty(t, rec.Promotion)
+
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				require.Len(t, promos.Items, 1)
+				assert.Equal(t, "f0", promos.Items[0].Spec.Freight)
+
+				cond := conditions.Get(&status, kargoapi.ConditionTypeRolledBack)
+				require.NotNil(t, cond)
+				assert.Equal(t, metav1.ConditionTrue, cond.Status)
+			},
+		},
+		{
+			name: "same rollback already at head of history -- no duplicate",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil,
+				[]kargoapi.RollbackRecord{{
+					From:      "f1",
+					To:        "f0",
+					Promotion: "earlier-promo",
+					Timestamp: metav1.Now(),
+				}},
+				1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				// History unchanged.
+				require.Len(t, status.RollbackHistory, 1)
+				assert.Equal(t, "earlier-promo", status.RollbackHistory[0].Promotion)
+				// No new Promotion created.
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "rate limit reached -- no rollback",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{
+					AutoRollbackOnVerificationFailure: true,
+					MaxAutoRollbacksPer24h:            2,
+				},
+				kargoapi.FreightHistory{
+					freightCol("f3", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil,
+				[]kargoapi.RollbackRecord{
+					{From: "f2", To: "f0", Timestamp: metav1.Now()},
+					{From: "f1", To: "f0", Timestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
+				},
+				1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				// History unchanged (no new entry prepended).
+				require.Len(t, status.RollbackHistory, 2)
+				assert.Equal(t, "f2", status.RollbackHistory[0].From)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "rate limit not reached because older entries aged out",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{
+					AutoRollbackOnVerificationFailure: true,
+					MaxAutoRollbacksPer24h:            1,
+				},
+				kargoapi.FreightHistory{
+					freightCol("f2", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil,
+				// 2 days ago -- outside the 24h window, so not counted.
+				[]kargoapi.RollbackRecord{
+					{From: "old", To: "older", Timestamp: metav1.NewTime(time.Now().Add(-48 * time.Hour))},
+				},
+				1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				require.Len(t, status.RollbackHistory, 2)
+				// New rollback is at the head.
+				assert.Equal(t, "f2", status.RollbackHistory[0].From)
+				assert.Equal(t, "f0", status.RollbackHistory[0].To)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				require.Len(t, promos.Items, 1)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &RegularStageReconciler{client: c}
+			status, err := r.autoRollbackOnVerificationFailure(t.Context(), tt.stage)
+			tt.assertions(t, c, status, err)
+		})
+	}
+}
+
+// TestReconcileIntegration_HaltAndRollback exercises the full reconcile()
+// method for both Layer 1 (halt on upstream Unhealthy) and Layer 2
+// (auto-rollback on verification failure). These are heavier than the
+// per-function unit tests above but confirm the wiring through the
+// subreconciler pipeline.
+func TestReconcileIntegration_HaltAndRollback(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, kargoapi.AddToScheme(scheme))
+	require.NoError(t, rolloutsapi.AddToScheme(scheme))
+
+	now := time.Now()
+
+	buildClient := func(objects []client.Object, interceptor interceptor.Funcs) client.Client {
+		return fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(objects...).
+			WithStatusSubresource(&kargoapi.Stage{}).
+			WithIndex(
+				&kargoapi.Promotion{},
+				indexer.PromotionsByStageField,
+				indexer.PromotionsByStage,
+			).
+			WithIndex(
+				&kargoapi.Freight{},
+				indexer.FreightByWarehouseField,
+				indexer.FreightByWarehouse,
+			).
+			WithIndex(
+				&kargoapi.Freight{},
+				indexer.FreightByCurrentStagesField,
+				indexer.FreightByCurrentStages,
+			).
+			WithIndex(
+				&kargoapi.Freight{},
+				indexer.FreightByVerifiedStagesField,
+				indexer.FreightByVerifiedStages,
+			).
+			WithIndex(
+				&kargoapi.Freight{},
+				indexer.FreightApprovedForStagesField,
+				indexer.FreightApprovedForStages,
+			).
+			WithIndex(
+				&kargoapi.Promotion{},
+				indexer.PromotionsByStageAndFreightField,
+				indexer.PromotionsByStageAndFreight,
+			).
+			WithInterceptorFuncs(interceptor).
+			Build()
+	}
+
+	t.Run("Layer 1: reconcile sets PromotionsHalted when upstream is Unhealthy", func(t *testing.T) {
+		upstream := &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "proj",
+				Name:      "upstream",
+			},
+			Status: kargoapi.StageStatus{
+				Health: &kargoapi.Health{Status: kargoapi.HealthStateUnhealthy},
+			},
+		}
+		downstream := &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:  "proj",
+				Name:       "downstream",
+				Generation: 1,
+			},
+			Spec: kargoapi.StageSpec{
+				RequestedFreight: []kargoapi.FreightRequest{{
+					Origin: kargoapi.FreightOrigin{
+						Kind: kargoapi.FreightOriginKindWarehouse,
+						Name: "wh",
+					},
+					Sources: kargoapi.FreightSources{
+						Stages: []string{"upstream"},
+					},
+				}},
+				PromotionPolicy: &kargoapi.StagePromotionPolicy{
+					OnUpstreamUnhealthy: kargoapi.OnUpstreamUnhealthyHalt,
+				},
+			},
+		}
+		projectConfig := &kargoapi.ProjectConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "proj",
+				Namespace: "proj",
+			},
+			Spec: kargoapi.ProjectConfigSpec{
+				PromotionPolicies: []kargoapi.PromotionPolicy{{
+					Stage:                "downstream",
+					AutoPromotionEnabled: true,
+				}},
+			},
+		}
+
+		c := buildClient(
+			[]client.Object{upstream, downstream, projectConfig},
+			interceptor.Funcs{},
+		)
+		r := &RegularStageReconciler{
+			client:        c,
+			eventSender:   k8sevent.NewEventSender(fakeevent.NewEventRecorder(10)),
+			healthChecker: &health.MockAggregatingChecker{},
+		}
+
+		status, _, err := r.reconcile(t.Context(), downstream, now)
+		require.NoError(t, err)
+
+		halted := conditions.Get(&status, kargoapi.ConditionTypePromotionsHalted)
+		require.NotNil(t, halted, "PromotionsHalted condition should be set")
+		assert.Equal(t, metav1.ConditionTrue, halted.Status)
+		assert.Equal(t, kargoapi.ReasonUpstreamUnhealthy, halted.Reason)
+		assert.Contains(t, halted.Message, "upstream")
+	})
+
+	t.Run("Layer 1: reconcile clears PromotionsHalted when upstream recovers", func(t *testing.T) {
+		upstream := &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "proj",
+				Name:      "upstream",
+			},
+			Status: kargoapi.StageStatus{
+				Health: &kargoapi.Health{Status: kargoapi.HealthStateHealthy},
+			},
+		}
+		warehouse := &kargoapi.Warehouse{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "proj",
+				Name:      "wh",
+			},
+		}
+		downstream := &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:  "proj",
+				Name:       "downstream",
+				Generation: 1,
+			},
+			Spec: kargoapi.StageSpec{
+				RequestedFreight: []kargoapi.FreightRequest{{
+					Origin: kargoapi.FreightOrigin{
+						Kind: kargoapi.FreightOriginKindWarehouse,
+						Name: "wh",
+					},
+					Sources: kargoapi.FreightSources{
+						Stages: []string{"upstream"},
+					},
+				}},
+				PromotionPolicy: &kargoapi.StagePromotionPolicy{
+					OnUpstreamUnhealthy: kargoapi.OnUpstreamUnhealthyHalt,
+				},
+			},
+			Status: kargoapi.StageStatus{
+				Conditions: []metav1.Condition{{
+					Type:   kargoapi.ConditionTypePromotionsHalted,
+					Status: metav1.ConditionTrue,
+					Reason: kargoapi.ReasonUpstreamUnhealthy,
+				}},
+			},
+		}
+		projectConfig := &kargoapi.ProjectConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "proj",
+				Namespace: "proj",
+			},
+			Spec: kargoapi.ProjectConfigSpec{
+				PromotionPolicies: []kargoapi.PromotionPolicy{{
+					Stage:                "downstream",
+					AutoPromotionEnabled: true,
+				}},
+			},
+		}
+
+		c := buildClient(
+			[]client.Object{upstream, downstream, projectConfig, warehouse},
+			interceptor.Funcs{},
+		)
+		r := &RegularStageReconciler{
+			client:        c,
+			eventSender:   k8sevent.NewEventSender(fakeevent.NewEventRecorder(10)),
+			healthChecker: &health.MockAggregatingChecker{},
+		}
+
+		status, _, err := r.reconcile(t.Context(), downstream, now)
+		// Auto-promote may error (no Freight available) — that's OK; we
+		// care that the halt condition was cleared by the earlier sub-reconciler.
+		_ = err
+
+		halted := conditions.Get(&status, kargoapi.ConditionTypePromotionsHalted)
+		assert.Nil(t, halted, "PromotionsHalted condition should be cleared")
+	})
+
+	t.Run("Layer 2: reconcile creates rollback Promotion on verification failure", func(t *testing.T) {
+		stage := &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:  "proj",
+				Name:       "rollback-stage",
+				Generation: 1,
+			},
+			Spec: kargoapi.StageSpec{
+				RequestedFreight: []kargoapi.FreightRequest{{
+					Origin: kargoapi.FreightOrigin{
+						Kind: kargoapi.FreightOriginKindWarehouse,
+						Name: "wh",
+					},
+					Sources: kargoapi.FreightSources{Direct: true},
+				}},
+				RollbackPolicy: &kargoapi.StageRollbackPolicy{
+					AutoRollbackOnVerificationFailure: true,
+					MaxAutoRollbacksPer24h:            3,
+				},
+				PromotionTemplate: &kargoapi.PromotionTemplate{
+					Spec: kargoapi.PromotionTemplateSpec{
+						Steps: []kargoapi.PromotionStep{{Uses: "noop"}},
+					},
+				},
+			},
+			Status: kargoapi.StageStatus{
+				FreightHistory: kargoapi.FreightHistory{
+					{
+						ID: "bad-freight-col",
+						Freight: map[string]kargoapi.FreightReference{
+							"Warehouse/wh": {
+								Name:   "bad-freight",
+								Origin: kargoapi.FreightOrigin{Kind: kargoapi.FreightOriginKindWarehouse, Name: "wh"},
+							},
+						},
+						VerificationHistory: kargoapi.VerificationInfoStack{{
+							ID:    "bad-verif",
+							Phase: kargoapi.VerificationPhaseFailed,
+						}},
+					},
+					{
+						ID: "good-freight-col",
+						Freight: map[string]kargoapi.FreightReference{
+							"Warehouse/wh": {
+								Name:   "good-freight",
+								Origin: kargoapi.FreightOrigin{Kind: kargoapi.FreightOriginKindWarehouse, Name: "wh"},
+							},
+						},
+						VerificationHistory: kargoapi.VerificationInfoStack{{
+							ID:    "good-verif",
+							Phase: kargoapi.VerificationPhaseSuccessful,
+						}},
+					},
+				},
+			},
+		}
+		warehouse := &kargoapi.Warehouse{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "proj",
+				Name:      "wh",
+			},
+		}
+		badFreight := &kargoapi.Freight{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "proj",
+				Name:      "bad-freight",
+			},
+			Origin: kargoapi.FreightOrigin{
+				Kind: kargoapi.FreightOriginKindWarehouse,
+				Name: "wh",
+			},
+			Status: kargoapi.FreightStatus{
+				CurrentlyIn: map[string]kargoapi.CurrentStage{
+					"rollback-stage": {},
+				},
+			},
+		}
+		goodFreight := &kargoapi.Freight{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "proj",
+				Name:      "good-freight",
+			},
+			Origin: kargoapi.FreightOrigin{
+				Kind: kargoapi.FreightOriginKindWarehouse,
+				Name: "wh",
+			},
+		}
+
+		c := buildClient(
+			[]client.Object{stage, warehouse, badFreight, goodFreight},
+			interceptor.Funcs{},
+		)
+		r := &RegularStageReconciler{
+			client:        c,
+			eventSender:   k8sevent.NewEventSender(fakeevent.NewEventRecorder(10)),
+			healthChecker: &health.MockAggregatingChecker{},
+		}
+
+		status, _, err := r.reconcile(t.Context(), stage, now)
+		require.NoError(t, err)
+
+		// Verify rollback occurred.
+		require.NotEmpty(t, status.RollbackHistory, "RollbackHistory should have an entry")
+		rec := status.RollbackHistory[0]
+		assert.Equal(t, "bad-freight", rec.From)
+		assert.Equal(t, "good-freight", rec.To)
+		assert.Equal(t, kargoapi.RollbackReasonVerificationFailed, rec.Reason)
+		assert.NotEmpty(t, rec.Promotion)
+
+		// Verify the rollback Promotion was actually created.
+		promos := &kargoapi.PromotionList{}
+		require.NoError(t, c.List(t.Context(), promos, client.InNamespace("proj")))
+		require.Len(t, promos.Items, 1)
+		assert.Equal(t, "good-freight", promos.Items[0].Spec.Freight)
+		assert.Equal(t, "rollback-stage", promos.Items[0].Spec.Stage)
+
+		// Verify condition.
+		rolledBack := conditions.Get(&status, kargoapi.ConditionTypeRolledBack)
+		require.NotNil(t, rolledBack)
+		assert.Equal(t, metav1.ConditionTrue, rolledBack.Status)
+	})
 }
