@@ -28,6 +28,10 @@ const (
 	// A Secret with this label can contain any type of credential, and is
 	// allowed to be managed through the Kargo API.
 	LabelValueCredentialTypeGeneric = "generic"
+	// LabelValueCredentialTypeFleet is the value for KubeFleet hub
+	// credentials. A Secret with this label value is expected to contain a
+	// kubeconfig or bearer token for connecting to a KubeFleet hub cluster.
+	LabelValueCredentialTypeFleet = "fleet"
 
 	// LabelKeyStage is used to identify the Stage that a resource is associated
 	// with. For example, an AnalysisRun created for a specific Stage has this

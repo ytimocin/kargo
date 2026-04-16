@@ -7,11 +7,11 @@ import (
 )
 
 func TestInitialize(t *testing.T) {
-	require.NotPanics(t, func() { Initialize(nil) })
+	require.NotPanics(t, func() { Initialize(nil, nil) })
 	// Should panic if called more than once
 	require.PanicsWithValue(
 		t,
 		"built-in health checkers already initialized",
-		func() { Initialize(nil) },
+		func() { Initialize(nil, nil) },
 	)
 }

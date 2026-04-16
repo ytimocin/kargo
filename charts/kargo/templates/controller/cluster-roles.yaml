@@ -131,6 +131,28 @@ rules:
   - patch
   - watch
 {{- end }}
+{{- if .Values.controller.kubefleet.integrationEnabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kargo-controller-kubefleet
+  labels:
+    {{- include "kargo.labels" . | nindent 4 }}
+    {{- include "kargo.controller.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - placement.kubernetes-fleet.io
+  resources:
+  - clusterresourceplacements
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+{{- end }}
 {{- if .Values.controller.rollouts.integrationEnabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
