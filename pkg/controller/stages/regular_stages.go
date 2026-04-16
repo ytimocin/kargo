@@ -483,6 +483,16 @@ func (r *RegularStageReconciler) reconcile(
 			},
 		},
 		{
+			name: "auto-rolling back on verification failure",
+			reconcile: func() (kargoapi.StageStatus, error) {
+				status, err := r.autoRollbackOnVerificationFailure(ctx, stage)
+				if err != nil {
+					err = fmt.Errorf("failed to auto-rollback: %w", err)
+				}
+				return status, err
+			},
+		},
+		{
 			name: "auto-promoting Freight",
 			reconcile: func() (kargoapi.StageStatus, error) {
 				status, err := r.autoPromoteFreight(ctx, stage)
@@ -2044,6 +2054,200 @@ func (r *RegularStageReconciler) upstreamHaltActive(
 	}
 	slices.Sort(unhealthy)
 	return unhealthy, nil
+}
+
+// defaultMaxAutoRollbacksPer24h is the fallback cap applied when a Stage's
+// rollbackPolicy.maxAutoRollbacksPer24h is unset or zero.
+const defaultMaxAutoRollbacksPer24h = int32(3)
+
+// autoRollbackOnVerificationFailure reacts to a terminal verification failure
+// (Failed or Error) on the Stage's current Freight. When the Stage opts in via
+// spec.rollbackPolicy.autoRollbackOnVerificationFailure, the controller
+// creates a Promotion that reverts to the last known healthy Freight.
+//
+// Guardrails:
+//   - Single-origin only. Multi-origin Stages are skipped (see TODO below)
+//     because a rollback would require coordinating multiple Promotions, which
+//     is out of scope for this initial implementation.
+//   - Skipped if a Promotion is currently running for the Stage, to avoid
+//     interfering with in-flight work.
+//   - A rollback is not retried if RollbackHistory[0] already records the same
+//     (From, To) pair -- this prevents loops when the rollback Promotion itself
+//     is slow to land.
+//   - Bounded by MaxAutoRollbacksPer24h (default 3) to prevent storms in the
+//     face of environmental failures unrelated to the Freight.
+//
+// TODO: extend to multi-origin Stages by creating one rollback Promotion per
+// origin, serialized so they can be observed independently.
+func (r *RegularStageReconciler) autoRollbackOnVerificationFailure(
+	ctx context.Context,
+	stage *kargoapi.Stage,
+) (kargoapi.StageStatus, error) {
+	logger := logging.LoggerFromContext(ctx)
+	newStatus := *stage.Status.DeepCopy()
+
+	policy := stage.Spec.RollbackPolicy
+	if policy == nil || !policy.AutoRollbackOnVerificationFailure {
+		return newStatus, nil
+	}
+
+	// Don't interrupt an in-flight Promotion.
+	if newStatus.CurrentPromotion != nil {
+		return newStatus, nil
+	}
+
+	// Keep the initial implementation to single-origin Stages. Multi-origin
+	// Stages require coordinating multiple Promotions; this can be added
+	// later. Until then, silently skip -- the user's opt-in wasn't a
+	// request to behave incorrectly.
+	if len(stage.Spec.RequestedFreight) != 1 {
+		return newStatus, nil
+	}
+
+	cur := newStatus.FreightHistory.Current()
+	if cur == nil || len(cur.Freight) == 0 || len(cur.VerificationHistory) == 0 {
+		return newStatus, nil
+	}
+
+	lastVerification := cur.VerificationHistory.Current()
+	if lastVerification == nil {
+		return newStatus, nil
+	}
+	if lastVerification.Phase != kargoapi.VerificationPhaseFailed &&
+		lastVerification.Phase != kargoapi.VerificationPhaseError {
+		return newStatus, nil
+	}
+
+	// Find the last known healthy Freight collection from the history --
+	// skipping the current (failed) entry and any other entry that doesn't
+	// have at least one Successful verification.
+	targetCol := findLastHealthyFreightCollection(newStatus.FreightHistory, cur.ID)
+	if targetCol == nil {
+		logger.Debug("no prior healthy Freight to roll back to; skipping")
+		return newStatus, nil
+	}
+
+	currentName := firstFreightName(cur)
+	targetName := firstFreightName(targetCol)
+	if currentName == "" || targetName == "" || currentName == targetName {
+		return newStatus, nil
+	}
+
+	// If the most recent rollback record already describes this exact
+	// From -> To transition, another rollback Promotion has already been
+	// created (possibly still running). Don't duplicate.
+	if len(newStatus.RollbackHistory) > 0 {
+		latest := newStatus.RollbackHistory[0]
+		if latest.From == currentName && latest.To == targetName {
+			return newStatus, nil
+		}
+	}
+
+	// Enforce the 24h rate limit.
+	limit := defaultMaxAutoRollbacksPer24h
+	if policy.MaxAutoRollbacksPer24h > 0 {
+		limit = policy.MaxAutoRollbacksPer24h
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	var recent int32
+	for _, entry := range newStatus.RollbackHistory {
+		if entry.Timestamp.After(cutoff) {
+			recent++
+		}
+	}
+	if recent >= limit {
+		logger.Info(
+			"auto-rollback 24h rate limit reached; skipping",
+			"limit", limit,
+			"recent", recent,
+		)
+		return newStatus, nil
+	}
+
+	logger.Info(
+		"creating auto-rollback Promotion",
+		"from", currentName,
+		"to", targetName,
+	)
+
+	promotion, err := kargo.NewPromotionBuilder(r.client).
+		Build(ctx, *stage, targetName)
+	if err != nil {
+		return newStatus, fmt.Errorf(
+			"error building rollback Promotion for Freight %q in namespace %q: %w",
+			targetName, stage.Namespace, err,
+		)
+	}
+	if err := r.client.Create(ctx, promotion); err != nil {
+		return newStatus, fmt.Errorf(
+			"error creating rollback Promotion for Freight %q in namespace %q: %w",
+			targetName, stage.Namespace, err,
+		)
+	}
+
+	record := kargoapi.RollbackRecord{
+		From:      currentName,
+		To:        targetName,
+		Promotion: promotion.Name,
+		Reason:    kargoapi.RollbackReasonVerificationFailed,
+		Timestamp: metav1.Now(),
+	}
+	newStatus.RollbackHistory = append(
+		[]kargoapi.RollbackRecord{record},
+		newStatus.RollbackHistory...,
+	)
+	const maxRollbackHistory = 10
+	if len(newStatus.RollbackHistory) > maxRollbackHistory {
+		newStatus.RollbackHistory = newStatus.RollbackHistory[:maxRollbackHistory]
+	}
+
+	conditions.Set(&newStatus, &metav1.Condition{
+		Type:   kargoapi.ConditionTypeRolledBack,
+		Status: metav1.ConditionTrue,
+		Reason: string(kargoapi.RollbackReasonVerificationFailed),
+		Message: fmt.Sprintf(
+			"auto-rollback initiated: Freight %q -> %q (Promotion %q)",
+			currentName, targetName, promotion.Name,
+		),
+	})
+
+	return newStatus, nil
+}
+
+// findLastHealthyFreightCollection walks the FreightHistory (most-recent-first)
+// and returns the first FreightCollection that is NOT the one with the given
+// skipID AND has at least one successful verification recorded.
+//
+// Returns nil if no such entry is found -- e.g. this is the first Freight and
+// nothing has been promoted before, or every prior entry also failed.
+func findLastHealthyFreightCollection(
+	history kargoapi.FreightHistory,
+	skipID string,
+) *kargoapi.FreightCollection {
+	for _, col := range history {
+		if col == nil || col.ID == skipID {
+			continue
+		}
+		for _, v := range col.VerificationHistory {
+			if v.Phase == kargoapi.VerificationPhaseSuccessful {
+				return col
+			}
+		}
+	}
+	return nil
+}
+
+// firstFreightName returns the Freight Name for the first origin in the
+// FreightCollection. For single-origin Stages this is the one Freight name;
+// for multi-origin callers we currently guard against upstream.
+func firstFreightName(col *kargoapi.FreightCollection) string {
+	if col == nil {
+		return ""
+	}
+	for _, ref := range col.Freight {
+		return ref.Name
+	}
+	return ""
 }
 
 // getPromotableFreight retrieves a map of []Freight promotable to the specified

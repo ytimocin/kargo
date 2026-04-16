@@ -111,6 +111,13 @@ const (
 	// the presence of the condition with a status of "True" indicates that
 	// auto-promotions are halted.
 	ConditionTypePromotionsHalted = "PromotionsHalted"
+	// ConditionTypeRolledBack denotes that the Stage's most recent transition
+	// was an auto-rollback initiated by the Stage controller in response to a
+	// verification failure. The condition remains True until a new manual or
+	// auto-promotion (other than an auto-rollback) occurs.
+	//
+	// This is an "abnormal-true" or "negative polarity" condition.
+	ConditionTypeRolledBack = "RolledBack"
 )
 
 // ReasonUpstreamUnhealthy is the Reason used for the PromotionsHalted

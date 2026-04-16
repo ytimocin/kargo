@@ -391,6 +391,34 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+              rollbackPolicy:
+                description: |-
+                  RollbackPolicy controls how the Stage reacts when verification of the
+                  current Freight fails. When enabled, the controller creates a
+                  Promotion that reverts the Stage to the last known healthy Freight.
+                properties:
+                  autoRollbackOnVerificationFailure:
+                    default: false
+                    description: |-
+                      AutoRollbackOnVerificationFailure determines whether the Stage
+                      controller automatically creates a Promotion that reverts to the last
+                      known healthy Freight when the current Freight's verification
+                      terminates with a Failed or Error phase.
+
+                      This is an explicit opt-in. Default behavior is unchanged.
+                    type: boolean
+                  maxAutoRollbacksPer24h:
+                    default: 3
+                    description: |-
+                      MaxAutoRollbacksPer24h caps how many automatic rollbacks may be
+                      initiated within any rolling 24-hour window. Once the cap is reached,
+                      further failures do not trigger rollback until older entries age out
+                      of the window. This is a safety valve to avoid tight rollback loops.
+                      Defaults to 3. A value of 0 is treated as the default.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
               shard:
                 description: |-
                   Shard is the name of the shard that this Stage belongs to. This is an
@@ -2258,6 +2286,46 @@ spec:
                   status was reconciled against.
                 format: int64
                 type: integer
+              rollbackHistory:
+                description: |-
+                  RollbackHistory is an audit trail of automatic rollbacks initiated by
+                  the Stage controller. The most recent entry is first. Truncated to the
+                  ten most recent entries.
+                items:
+                  description: |-
+                    RollbackRecord describes a single automatic rollback that the Stage
+                    controller initiated.
+                  properties:
+                    from:
+                      description: |-
+                        From is the name of the Freight that was rolled back from. This is the
+                        Freight whose verification failed.
+                      type: string
+                    promotion:
+                      description: |-
+                        Promotion is the name of the Promotion resource created to effect the
+                        rollback.
+                      type: string
+                    reason:
+                      description: |-
+                        Reason is a short machine-friendly identifier describing why the
+                        rollback was initiated.
+                      type: string
+                    timestamp:
+                      description: Timestamp is when the rollback was initiated.
+                      format: date-time
+                      type: string
+                    to:
+                      description: |-
+                        To is the name of the Freight that was rolled back to. This is the
+                        last known healthy Freight prior to the failure.
+                      type: string
+                  required:
+                  - from
+                  - timestamp
+                  - to
+                  type: object
+                type: array
             type: object
         required:
         - spec
