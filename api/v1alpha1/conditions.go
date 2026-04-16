@@ -101,4 +101,12 @@ const (
 	// the criteria have been satisfied, and the absence of the condition or
 	// a status of "False" indicates that no new Freight was created.
 	ConditionTypeFreightCreated = "FreightCreated"
+
+	// ConditionTypeRolledBack denotes that the Stage's most recent transition
+	// was an auto-rollback initiated by the Stage controller in response to a
+	// verification failure. The condition remains True until a new manual or
+	// auto-promotion (other than an auto-rollback) occurs.
+	//
+	// This is an "abnormal-true" or "negative polarity" condition.
+	ConditionTypeRolledBack = "RolledBack"
 )

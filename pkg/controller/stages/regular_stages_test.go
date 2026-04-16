@@ -6886,3 +6886,349 @@ func Test_buildFreightSummary(t *testing.T) {
 		})
 	}
 }
+
+func Test_findLastHealthyFreightCollection(t *testing.T) {
+	verified := &kargoapi.VerificationInfo{Phase: kargoapi.VerificationPhaseSuccessful}
+	failed := &kargoapi.VerificationInfo{Phase: kargoapi.VerificationPhaseFailed}
+
+	col := func(id string, verif *kargoapi.VerificationInfo) *kargoapi.FreightCollection {
+		c := &kargoapi.FreightCollection{ID: id}
+		if verif != nil {
+			c.VerificationHistory = kargoapi.VerificationInfoStack{*verif}
+		}
+		return c
+	}
+
+	tests := []struct {
+		name     string
+		history  kargoapi.FreightHistory
+		skipID   string
+		expectID string
+	}{
+		{name: "empty history", history: nil, expectID: ""},
+		{
+			name:    "only one entry, matches skip",
+			history: kargoapi.FreightHistory{col("a", verified)},
+			skipID:  "a",
+		},
+		{
+			name: "skip current, prior healthy",
+			history: kargoapi.FreightHistory{
+				col("current", failed),
+				col("prior", verified),
+			},
+			skipID:   "current",
+			expectID: "prior",
+		},
+		{
+			name: "skip current, every prior is failed",
+			history: kargoapi.FreightHistory{
+				col("current", failed),
+				col("older", failed),
+			},
+			skipID: "current",
+		},
+		{
+			name: "returns most recent healthy prior",
+			history: kargoapi.FreightHistory{
+				col("current", failed),
+				col("second", verified),
+				col("third", verified),
+			},
+			skipID:   "current",
+			expectID: "second",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findLastHealthyFreightCollection(tt.history, tt.skipID)
+			if tt.expectID == "" {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, tt.expectID, got.ID)
+		})
+	}
+}
+
+func TestRegularStageReconciler_autoRollbackOnVerificationFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, kargoapi.AddToScheme(scheme))
+
+	const (
+		ns        = "proj"
+		stageName = "test"
+	)
+
+	// Shared helpers.
+	freightRef := func(name string) kargoapi.FreightReference {
+		return kargoapi.FreightReference{
+			Name: name,
+			Origin: kargoapi.FreightOrigin{
+				Kind: kargoapi.FreightOriginKindWarehouse,
+				Name: "wh",
+			},
+		}
+	}
+	freightCol := func(name string, phase kargoapi.VerificationPhase) *kargoapi.FreightCollection {
+		c := &kargoapi.FreightCollection{
+			ID:      name + "-id",
+			Freight: map[string]kargoapi.FreightReference{"Warehouse/wh": freightRef(name)},
+		}
+		if phase != "" {
+			c.VerificationHistory = kargoapi.VerificationInfoStack{
+				{ID: name + "-verif", Phase: phase},
+			}
+		}
+		return c
+	}
+	stageWith := func(
+		policy *kargoapi.StageRollbackPolicy,
+		history kargoapi.FreightHistory,
+		currentPromo *kargoapi.PromotionReference,
+		rollbackHistory []kargoapi.RollbackRecord,
+		origins int,
+	) *kargoapi.Stage {
+		reqs := make([]kargoapi.FreightRequest, origins)
+		for i := range origins {
+			reqs[i] = kargoapi.FreightRequest{
+				Origin: kargoapi.FreightOrigin{
+					Kind: kargoapi.FreightOriginKindWarehouse,
+					Name: fmt.Sprintf("wh-%d", i),
+				},
+			}
+		}
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: stageName, Namespace: ns},
+			Spec: kargoapi.StageSpec{
+				RequestedFreight: reqs,
+				RollbackPolicy:   policy,
+				PromotionTemplate: &kargoapi.PromotionTemplate{
+					Spec: kargoapi.PromotionTemplateSpec{
+						Steps: []kargoapi.PromotionStep{{Uses: "noop"}},
+					},
+				},
+			},
+			Status: kargoapi.StageStatus{
+				FreightHistory:   history,
+				CurrentPromotion: currentPromo,
+				RollbackHistory:  rollbackHistory,
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		stage      *kargoapi.Stage
+		assertions func(*testing.T, client.Client, kargoapi.StageStatus, error)
+	}{
+		{
+			name:  "no RollbackPolicy -- no-op",
+			stage: stageWith(nil, kargoapi.FreightHistory{freightCol("f1", kargoapi.VerificationPhaseFailed)}, nil, nil, 1),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "policy disabled -- no-op",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: false},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "multi-origin -- skipped",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil, nil, 2,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "current promotion in flight -- skipped",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				&kargoapi.PromotionReference{Name: "in-flight"}, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "current freight is not Failed/Error -- no-op",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{freightCol("f1", kargoapi.VerificationPhaseSuccessful)},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "Failed verification but no prior healthy -- no-op",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{freightCol("f1", kargoapi.VerificationPhaseFailed)},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, _ client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, status.RollbackHistory)
+			},
+		},
+		{
+			name: "Failed verification with prior healthy -- creates rollback Promotion",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil, nil, 1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				require.Len(t, status.RollbackHistory, 1)
+				rec := status.RollbackHistory[0]
+				assert.Equal(t, "f1", rec.From)
+				assert.Equal(t, "f0", rec.To)
+				assert.Equal(t, kargoapi.RollbackReasonVerificationFailed, rec.Reason)
+				assert.NotEmpty(t, rec.Promotion)
+
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				require.Len(t, promos.Items, 1)
+				assert.Equal(t, "f0", promos.Items[0].Spec.Freight)
+
+				cond := conditions.Get(&status, kargoapi.ConditionTypeRolledBack)
+				require.NotNil(t, cond)
+				assert.Equal(t, metav1.ConditionTrue, cond.Status)
+			},
+		},
+		{
+			name: "same rollback already at head of history -- no duplicate",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{AutoRollbackOnVerificationFailure: true},
+				kargoapi.FreightHistory{
+					freightCol("f1", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil,
+				[]kargoapi.RollbackRecord{{
+					From:      "f1",
+					To:        "f0",
+					Promotion: "earlier-promo",
+					Timestamp: metav1.Now(),
+				}},
+				1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				// History unchanged.
+				require.Len(t, status.RollbackHistory, 1)
+				assert.Equal(t, "earlier-promo", status.RollbackHistory[0].Promotion)
+				// No new Promotion created.
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "rate limit reached -- no rollback",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{
+					AutoRollbackOnVerificationFailure: true,
+					MaxAutoRollbacksPer24h:            2,
+				},
+				kargoapi.FreightHistory{
+					freightCol("f3", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil,
+				[]kargoapi.RollbackRecord{
+					{From: "f2", To: "f0", Timestamp: metav1.Now()},
+					{From: "f1", To: "f0", Timestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
+				},
+				1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				// History unchanged (no new entry prepended).
+				require.Len(t, status.RollbackHistory, 2)
+				assert.Equal(t, "f2", status.RollbackHistory[0].From)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				assert.Empty(t, promos.Items)
+			},
+		},
+		{
+			name: "rate limit not reached because older entries aged out",
+			stage: stageWith(
+				&kargoapi.StageRollbackPolicy{
+					AutoRollbackOnVerificationFailure: true,
+					MaxAutoRollbacksPer24h:            1,
+				},
+				kargoapi.FreightHistory{
+					freightCol("f2", kargoapi.VerificationPhaseFailed),
+					freightCol("f0", kargoapi.VerificationPhaseSuccessful),
+				},
+				nil,
+				// 2 days ago -- outside the 24h window, so not counted.
+				[]kargoapi.RollbackRecord{
+					{From: "old", To: "older", Timestamp: metav1.NewTime(time.Now().Add(-48 * time.Hour))},
+				},
+				1,
+			),
+			assertions: func(t *testing.T, c client.Client, status kargoapi.StageStatus, err error) {
+				require.NoError(t, err)
+				require.Len(t, status.RollbackHistory, 2)
+				// New rollback is at the head.
+				assert.Equal(t, "f2", status.RollbackHistory[0].From)
+				assert.Equal(t, "f0", status.RollbackHistory[0].To)
+				promos := &kargoapi.PromotionList{}
+				require.NoError(t, c.List(t.Context(), promos, client.InNamespace(ns)))
+				require.Len(t, promos.Items, 1)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &RegularStageReconciler{client: c}
+			status, err := r.autoRollbackOnVerificationFailure(t.Context(), tt.stage)
+			tt.assertions(t, c, status, err)
+		})
+	}
+}

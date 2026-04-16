@@ -121,6 +121,16 @@ const (
 	FreightAvailabilityStrategyOneOf FreightAvailabilityStrategy = "OneOf"
 )
 
+// RollbackReason is a short machine-friendly identifier recorded on a
+// RollbackRecord describing what caused the rollback.
+type RollbackReason string
+
+const (
+	// RollbackReasonVerificationFailed indicates that the current Freight
+	// failed verification (Failed or Error phase).
+	RollbackReasonVerificationFailed RollbackReason = "VerificationFailed"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name=Shard,type=string,JSONPath=`.spec.shard`
@@ -226,6 +236,32 @@ type StageSpec struct {
 	// Verification describes how to verify a Stage's current Freight is fit for
 	// promotion downstream.
 	Verification *Verification `json:"verification,omitempty" protobuf:"bytes,3,opt,name=verification"`
+	// RollbackPolicy controls how the Stage reacts when verification of the
+	// current Freight fails. When enabled, the controller creates a
+	// Promotion that reverts the Stage to the last known healthy Freight.
+	RollbackPolicy *StageRollbackPolicy `json:"rollbackPolicy,omitempty" protobuf:"bytes,8,opt,name=rollbackPolicy"`
+}
+
+// StageRollbackPolicy controls how a Stage reacts to verification failures.
+type StageRollbackPolicy struct {
+	// AutoRollbackOnVerificationFailure determines whether the Stage
+	// controller automatically creates a Promotion that reverts to the last
+	// known healthy Freight when the current Freight's verification
+	// terminates with a Failed or Error phase.
+	//
+	// This is an explicit opt-in. Default behavior is unchanged.
+	//
+	// +kubebuilder:default=false
+	AutoRollbackOnVerificationFailure bool `json:"autoRollbackOnVerificationFailure,omitempty" protobuf:"varint,1,opt,name=autoRollbackOnVerificationFailure"`
+	// MaxAutoRollbacksPer24h caps how many automatic rollbacks may be
+	// initiated within any rolling 24-hour window. Once the cap is reached,
+	// further failures do not trigger rollback until older entries age out
+	// of the window. This is a safety valve to avoid tight rollback loops.
+	// Defaults to 3. A value of 0 is treated as the default.
+	//
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=3
+	MaxAutoRollbacksPer24h int32 `json:"maxAutoRollbacksPer24h,omitempty" protobuf:"varint,2,opt,name=maxAutoRollbacksPer24h"`
 }
 
 // FreightRequest expresses a Stage's need for Freight having originated from a
@@ -426,6 +462,29 @@ type StageStatus struct {
 	// This is useful for storing additional information about the Stage
 	// that can be shared across promotions, verifications, or other processes.
 	Metadata map[string]apiextensionsv1.JSON `json:"metadata,omitempty" protobuf:"bytes,15,rep,name=metadata" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// RollbackHistory is an audit trail of automatic rollbacks initiated by
+	// the Stage controller. The most recent entry is first. Truncated to the
+	// ten most recent entries.
+	RollbackHistory []RollbackRecord `json:"rollbackHistory,omitempty" protobuf:"bytes,16,rep,name=rollbackHistory"`
+}
+
+// RollbackRecord describes a single automatic rollback that the Stage
+// controller initiated.
+type RollbackRecord struct {
+	// From is the name of the Freight that was rolled back from. This is the
+	// Freight whose verification failed.
+	From string `json:"from" protobuf:"bytes,1,opt,name=from"`
+	// To is the name of the Freight that was rolled back to. This is the
+	// last known healthy Freight prior to the failure.
+	To string `json:"to" protobuf:"bytes,2,opt,name=to"`
+	// Promotion is the name of the Promotion resource created to effect the
+	// rollback.
+	Promotion string `json:"promotion,omitempty" protobuf:"bytes,3,opt,name=promotion"`
+	// Reason is a short machine-friendly identifier describing why the
+	// rollback was initiated.
+	Reason RollbackReason `json:"reason,omitempty" protobuf:"bytes,4,opt,name=reason"`
+	// Timestamp is when the rollback was initiated.
+	Timestamp metav1.Time `json:"timestamp" protobuf:"bytes,5,opt,name=timestamp"`
 }
 
 // GetConditions implements the conditions.Getter interface.
