@@ -121,6 +121,22 @@ const (
 	FreightAvailabilityStrategyOneOf FreightAvailabilityStrategy = "OneOf"
 )
 
+// OnUpstreamUnhealthyPolicy specifies what the Stage controller does when one
+// or more upstream Stages have current Freight in an Unhealthy state.
+//
+// +kubebuilder:validation:Enum={Halt,Proceed}
+type OnUpstreamUnhealthyPolicy string
+
+const (
+	// OnUpstreamUnhealthyHalt blocks new auto-promotions into the Stage while
+	// any upstream Stage's current Freight is Unhealthy. The halt is surfaced
+	// via the PromotionsHalted status condition.
+	OnUpstreamUnhealthyHalt OnUpstreamUnhealthyPolicy = "Halt"
+	// OnUpstreamUnhealthyProceed allows auto-promotions to proceed regardless
+	// of upstream Stage health. This is the default behavior.
+	OnUpstreamUnhealthyProceed OnUpstreamUnhealthyPolicy = "Proceed"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name=Shard,type=string,JSONPath=`.spec.shard`
@@ -226,6 +242,25 @@ type StageSpec struct {
 	// Verification describes how to verify a Stage's current Freight is fit for
 	// promotion downstream.
 	Verification *Verification `json:"verification,omitempty" protobuf:"bytes,3,opt,name=verification"`
+	// PromotionPolicy describes per-Stage policy for how Promotions are
+	// created. This field is distinct from the ProjectConfig.PromotionPolicy
+	// resource: the ProjectConfig resource governs which Stages have
+	// auto-promotion enabled at all, while this field governs behavior such as
+	// halting auto-promotions when upstream Stages are Unhealthy.
+	PromotionPolicy *StagePromotionPolicy `json:"promotionPolicy,omitempty" protobuf:"bytes,8,opt,name=promotionPolicy"`
+}
+
+// StagePromotionPolicy describes per-Stage policy for how Promotions into
+// this Stage are created.
+type StagePromotionPolicy struct {
+	// OnUpstreamUnhealthy controls what happens when one or more upstream
+	// Stages have current Freight in an Unhealthy state. "Halt" blocks new
+	// auto-promotions into this Stage until all upstream Stages recover;
+	// "Proceed" allows auto-promotions regardless. If unspecified, defaults
+	// to "Proceed".
+	//
+	// +kubebuilder:default=Proceed
+	OnUpstreamUnhealthy OnUpstreamUnhealthyPolicy `json:"onUpstreamUnhealthy,omitempty" protobuf:"bytes,1,opt,name=onUpstreamUnhealthy"`
 }
 
 // FreightRequest expresses a Stage's need for Freight having originated from a
