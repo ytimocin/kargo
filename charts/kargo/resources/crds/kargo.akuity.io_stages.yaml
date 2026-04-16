@@ -60,6 +60,27 @@ spec:
               Spec describes sources of Freight used by the Stage and how to incorporate
               Freight into the Stage.
             properties:
+              promotionPolicy:
+                description: |-
+                  PromotionPolicy describes per-Stage policy for how Promotions are
+                  created. This field is distinct from the ProjectConfig.PromotionPolicy
+                  resource: the ProjectConfig resource governs which Stages have
+                  auto-promotion enabled at all, while this field governs behavior such as
+                  halting auto-promotions when upstream Stages are Unhealthy.
+                properties:
+                  onUpstreamUnhealthy:
+                    default: Proceed
+                    description: |-
+                      OnUpstreamUnhealthy controls what happens when one or more upstream
+                      Stages have current Freight in an Unhealthy state. "Halt" blocks new
+                      auto-promotions into this Stage until all upstream Stages recover;
+                      "Proceed" allows auto-promotions regardless. If unspecified, defaults
+                      to "Proceed".
+                    enum:
+                    - Halt
+                    - Proceed
+                    type: string
+                type: object
               promotionTemplate:
                 description: |-
                   PromotionTemplate describes how to incorporate Freight into the Stage

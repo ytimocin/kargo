@@ -1691,6 +1691,33 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 	}
 	newStatus.AutoPromotionEnabled = true
 
+	// Check if auto-promotions into this Stage should be halted because one or
+	// more upstream Stages have current Freight in an Unhealthy state AND
+	// spec.promotionPolicy.onUpstreamUnhealthy is "Halt". When halted, surface
+	// a PromotionsHalted condition and return early; recovery is detected on
+	// subsequent reconciles when upstream health is restored.
+	unhealthyUpstreams, err := r.upstreamHaltActive(ctx, stage)
+	if err != nil {
+		return newStatus, err
+	}
+	if len(unhealthyUpstreams) > 0 {
+		conditions.Set(&newStatus, &metav1.Condition{
+			Type:   kargoapi.ConditionTypePromotionsHalted,
+			Status: metav1.ConditionTrue,
+			Reason: kargoapi.ReasonUpstreamUnhealthy,
+			Message: fmt.Sprintf(
+				"auto-promotions halted; upstream Stage(s) with Unhealthy Freight: %s",
+				strings.Join(unhealthyUpstreams, ", "),
+			),
+		})
+		logger.Info(
+			"halting auto-promotion due to unhealthy upstream Stages",
+			"upstreams", unhealthyUpstreams,
+		)
+		return newStatus, nil
+	}
+	conditions.Delete(&newStatus, kargoapi.ConditionTypePromotionsHalted)
+
 	// Retrieve promotable Freight for the Stage.
 	promotableFreight, err := r.getPromotableFreight(ctx, stage)
 	if err != nil {
@@ -1969,6 +1996,54 @@ func (r *RegularStageReconciler) autoPromotionAllowed(
 
 	logger.Debug("found no PromotionPolicy associated with Stage")
 	return false, nil
+}
+
+// upstreamHaltActive returns the sorted set of upstream Stage names whose
+// current Freight is Unhealthy, IF the Stage opts into halt behavior via
+// spec.promotionPolicy.onUpstreamUnhealthy = "Halt". Callers treat a
+// non-empty return value as a signal to skip auto-promotion for this
+// reconcile.
+//
+// Missing upstream Stages are ignored -- they cannot block promotion, and
+// returning an error for a legitimate NotFound would wedge the Stage.
+func (r *RegularStageReconciler) upstreamHaltActive(
+	ctx context.Context,
+	stage *kargoapi.Stage,
+) ([]string, error) {
+	if stage.Spec.PromotionPolicy == nil ||
+		stage.Spec.PromotionPolicy.OnUpstreamUnhealthy != kargoapi.OnUpstreamUnhealthyHalt {
+		return nil, nil
+	}
+
+	seen := map[string]struct{}{}
+	var unhealthy []string
+	for _, req := range stage.Spec.RequestedFreight {
+		for _, upName := range req.Sources.Stages {
+			if _, ok := seen[upName]; ok {
+				continue
+			}
+			seen[upName] = struct{}{}
+			upstream := &kargoapi.Stage{}
+			if err := r.client.Get(ctx, types.NamespacedName{
+				Namespace: stage.Namespace,
+				Name:      upName,
+			}, upstream); err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return nil, fmt.Errorf(
+					"error getting upstream Stage %q in namespace %q: %w",
+					upName, stage.Namespace, err,
+				)
+			}
+			if upstream.Status.Health != nil &&
+				upstream.Status.Health.Status == kargoapi.HealthStateUnhealthy {
+				unhealthy = append(unhealthy, upName)
+			}
+		}
+	}
+	slices.Sort(unhealthy)
+	return unhealthy, nil
 }
 
 // getPromotableFreight retrieves a map of []Freight promotable to the specified

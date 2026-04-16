@@ -6480,6 +6480,203 @@ func TestRegularStageReconciler_autoPromotionAllowed(t *testing.T) {
 	}
 }
 
+func TestRegularStageReconciler_upstreamHaltActive(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, kargoapi.AddToScheme(scheme))
+
+	// Shared helpers for constructing upstream Stage fixtures.
+	healthy := func(name string) *kargoapi.Stage {
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "proj"},
+			Status: kargoapi.StageStatus{
+				Health: &kargoapi.Health{Status: kargoapi.HealthStateHealthy},
+			},
+		}
+	}
+	unhealthy := func(name string) *kargoapi.Stage {
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "proj"},
+			Status: kargoapi.StageStatus{
+				Health: &kargoapi.Health{Status: kargoapi.HealthStateUnhealthy},
+			},
+		}
+	}
+	noHealth := func(name string) *kargoapi.Stage {
+		return &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "proj"},
+		}
+	}
+
+	stageWithPolicy := func(
+		policy kargoapi.OnUpstreamUnhealthyPolicy,
+		upstreams ...string,
+	) *kargoapi.Stage {
+		s := &kargoapi.Stage{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "proj"},
+			Spec: kargoapi.StageSpec{
+				RequestedFreight: []kargoapi.FreightRequest{{
+					Sources: kargoapi.FreightSources{Stages: upstreams},
+				}},
+			},
+		}
+		if policy != "" {
+			s.Spec.PromotionPolicy = &kargoapi.StagePromotionPolicy{
+				OnUpstreamUnhealthy: policy,
+			}
+		}
+		return s
+	}
+
+	tests := []struct {
+		name        string
+		stage       *kargoapi.Stage
+		objects     []client.Object
+		interceptor interceptor.Funcs
+		assertions  func(*testing.T, []string, error)
+	}{
+		{
+			name:  "no PromotionPolicy -- never halts",
+			stage: stageWithPolicy("", "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "PromotionPolicy=Proceed -- never halts",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyProceed, "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + all upstreams healthy -- does not halt",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1", "upstream-2"),
+			objects: []client.Object{
+				healthy("upstream-1"),
+				healthy("upstream-2"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + one upstream Unhealthy -- halts on that upstream",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1", "upstream-2"),
+			objects: []client.Object{
+				healthy("upstream-1"),
+				unhealthy("upstream-2"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"upstream-2"}, halted)
+			},
+		},
+		{
+			name: "Halt + multiple upstreams Unhealthy -- returns all, sorted",
+			stage: stageWithPolicy(
+				kargoapi.OnUpstreamUnhealthyHalt,
+				"upstream-b", "upstream-a",
+			),
+			objects: []client.Object{
+				unhealthy("upstream-a"),
+				unhealthy("upstream-b"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"upstream-a", "upstream-b"}, halted)
+			},
+		},
+		{
+			name:  "Halt + upstream has no Health status -- treated as not Unhealthy",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1"),
+			objects: []client.Object{
+				noHealth("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + upstream not found -- ignored, does not halt",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "missing"),
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				assert.Empty(t, halted)
+			},
+		},
+		{
+			name:  "Halt + same upstream referenced from multiple FreightRequests -- deduped",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.NoError(t, err)
+				// Even though we'll add a second FreightRequest below,
+				// the same upstream must appear only once.
+				assert.Equal(t, []string{"upstream-1"}, halted)
+			},
+		},
+		{
+			name:  "Halt + non-NotFound Get error -- propagates",
+			stage: stageWithPolicy(kargoapi.OnUpstreamUnhealthyHalt, "upstream-1"),
+			objects: []client.Object{
+				unhealthy("upstream-1"),
+			},
+			interceptor: interceptor.Funcs{
+				Get: func(
+					_ context.Context,
+					_ client.WithWatch,
+					_ client.ObjectKey,
+					_ client.Object,
+					_ ...client.GetOption,
+				) error {
+					return fmt.Errorf("transient API error")
+				},
+			},
+			assertions: func(t *testing.T, halted []string, err error) {
+				require.ErrorContains(t, err, "transient API error")
+				assert.Nil(t, halted)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "Halt + same upstream referenced from multiple FreightRequests -- deduped" {
+				tt.stage.Spec.RequestedFreight = append(
+					tt.stage.Spec.RequestedFreight,
+					kargoapi.FreightRequest{
+						Sources: kargoapi.FreightSources{Stages: []string{"upstream-1"}},
+					},
+				)
+			}
+
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if len(tt.objects) > 0 {
+				builder = builder.WithObjects(tt.objects...)
+			}
+			if tt.interceptor.Get != nil {
+				builder = builder.WithInterceptorFuncs(tt.interceptor)
+			}
+			r := &RegularStageReconciler{client: builder.Build()}
+
+			halted, err := r.upstreamHaltActive(t.Context(), tt.stage)
+			tt.assertions(t, halted, err)
+		})
+	}
+}
+
 func Test_summarizeConditions(t *testing.T) {
 	tests := []struct {
 		name       string
